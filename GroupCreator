@@ -1,0 +1,166 @@
+using UnityEngine;
+using UnityEngine.Jobs;
+using Unity.Mathematics;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Burst;
+
+/// <summary>
+/// Author: Iván Moreno García-Fresneda.
+/// 
+/// You must download this packages from package manager:
+/// -Entities
+/// -Jobs
+/// -Burst
+/// -Mathematics
+/// 
+/// Feel free to use it! :)
+/// </summary>
+public class GroupCreator : MonoBehaviour
+{
+    [Header("Instantiation configuration")]
+    [SerializeField] private int fishCount;
+    [SerializeField] private Transform fishPrefab;
+
+    [Space]
+    [Header("Group rules")]
+    [SerializeField] private float detectionDistance;
+    [SerializeField] private float avoidDistance;
+    [SerializeField] private Transform destination;
+
+    private Fish[] fishes;
+
+    public class Fish
+    {
+        public Transform transform;
+
+        public float speed;
+        public float rotSpeed;
+    }
+
+    private void Start() => GenerateEntities();
+
+    /// <summary>
+    /// Generates all the entities that will be in the same group.
+    /// </summary>
+    private void GenerateEntities()
+    {
+        fishes = new Fish[fishCount];
+
+        for (int index = 0; index < fishCount; index++)
+        {
+            Vector3 randomPos = transform.position + new Vector3(UnityEngine.Random.Range(-5, 5),
+                                                                 UnityEngine.Random.Range(-5, 5),
+                                                                 UnityEngine.Random.Range(-5, 5));
+
+            Transform fishTransform = Instantiate(fishPrefab, randomPos, Quaternion.identity);
+
+            Fish fish = new Fish()
+            {
+                transform = fishTransform,
+                rotSpeed = UnityEngine.Random.Range(1f, 2f),
+                speed = UnityEngine.Random.Range(4f, 6f)
+            };
+
+            fishes[index] = fish;
+        }
+    }
+
+    private void Update()
+    {
+        //Creation of arrays that will hold the information that we´ll send to others threads.
+        NativeArray<float> rotSpeeds = new NativeArray<float>(fishes.Length, Allocator.TempJob);
+        NativeArray<float> moveSpeeds = new NativeArray<float>(fishes.Length, Allocator.TempJob);
+        NativeArray<Vector3> group = new NativeArray<Vector3>(fishes.Length, Allocator.TempJob);
+
+        TransformAccessArray transforms = new TransformAccessArray(fishes.Length);
+
+        //We fill each array with the information of each entity.
+        for (int i = 0; i < rotSpeeds.Length; i++)
+        {
+            rotSpeeds[i] = fishes[i].rotSpeed;
+            moveSpeeds[i] = fishes[i].speed;
+            group[i] = fishes[i].transform.position;
+            transforms.Add(fishes[i].transform);
+        }
+
+        //Creation of the task is going to move our entities.
+        FishMovementCalculation task = new FishMovementCalculation()
+        {
+            destination = destination.position,
+            rotationSpeeds = rotSpeeds,
+            moveSpeeds = moveSpeeds,
+            group = group,
+            detectionDistance = detectionDistance,
+            avoidDistance = avoidDistance,
+            deltaTime = Time.deltaTime
+        };
+
+        JobHandle jobHandle = task.Schedule(transforms);
+        jobHandle.Complete();
+
+        //Dispose of arrays to avoid memory leak.
+        rotSpeeds.Dispose();
+        moveSpeeds.Dispose();
+        group.Dispose();
+        transforms.Dispose();
+    }
+}
+
+[BurstCompile]
+public struct FishMovementCalculation : IJobParallelForTransform
+{
+    public NativeArray<float> rotationSpeeds;
+    public NativeArray<float> moveSpeeds;
+
+    [ReadOnly] public NativeArray<Vector3> group;
+
+    public float3 destination;
+    public float detectionDistance;
+    public float avoidDistance;
+    public float deltaTime;
+
+    public void Execute(int index, TransformAccess transform)
+    {
+        transform.position += (Vector3)math.forward(transform.rotation) * moveSpeeds[index] * deltaTime;
+
+        float3 averageCenter = new float3();
+        float3 averageAvoid = new float3();
+
+        int groupSize = 0;
+
+        for (int i = 0; i < group.Length; i++)
+        {
+            //Ignore myself in the group.
+            if (group[i] == transform.position) continue;
+
+            float distanceBt = Vector3.Distance(group[i], transform.position);
+
+            //If I´m nearby to other entity add it to the group.
+            if (distanceBt < detectionDistance)
+            {
+                groupSize++;
+
+                averageCenter += (float3)group[i];
+
+                //If is too near we must avoid it.
+                if (distanceBt < avoidDistance)
+                {
+                    averageAvoid += (float3)(transform.position - group[i]);
+                }
+            }
+        }
+
+        if (groupSize > 0)
+        {
+            //Make a media to get the group center and add the direction we want to face.
+            averageCenter = averageCenter / groupSize + (destination - (float3)transform.position);
+
+            Vector3 dir = averageCenter + averageAvoid - (float3)transform.position;
+
+            transform.rotation = Quaternion.Slerp(transform.rotation,
+                                                   Quaternion.LookRotation(dir),
+                                                   rotationSpeeds[index] * deltaTime);
+        }
+    }
+}
